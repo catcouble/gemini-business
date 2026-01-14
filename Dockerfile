@@ -74,6 +74,8 @@ exec "$@"\n' > /app/start-xvfb.sh && chmod +x /app/start-xvfb.sh
 
 # 设置环境变量
 ENV DISPLAY=:99
+# 设置时区为东八区（北京时间）
+ENV TZ=Asia/Shanghai
 
 # 使用 Xvfb 启动脚本作为 entrypoint
 ENTRYPOINT ["/app/start-xvfb.sh"]
