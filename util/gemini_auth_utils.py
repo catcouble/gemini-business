@@ -12,7 +12,11 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 
 import requests
+import urllib3
+
 from core.config import config
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logger = logging.getLogger("gemini.auth_utils")
 
@@ -64,24 +68,66 @@ class GeminiAuthHelper:
                     emails = r.json().get('results', {})
                     for mail in emails:
                         if mail.get("address") == email and mail.get("source") == self.config.google_mail:
-                            metadata = json.loads(mail["metadata"])
-                            code = metadata["ai_extract"]["result"]
-                            
-                            # 获取验证码后立即删除邮件，避免后续刷新时误取旧验证码
+                            logger.info(f"📩 找到邮件 [{mail.get('id')}]，正在提取验证码...")
+                            code = None
                             mail_id = mail.get("id")
-                            if mail_id:
-                                try:
-                                    requests.delete(
-                                        f"{self.config.mail_api}/admin/mails/{mail_id}",
-                                        headers={"x-admin-auth": self.config.admin_key},
-                                        timeout=10,
-                                        verify=False
-                                    )
-                                    logger.info(f"🗑️ 已删除邮件 [{mail_id}]")
-                                except Exception as e:
-                                    logger.warning(f"⚠️ 删除邮件失败 [{mail_id}]: {e}")
                             
-                            return code
+                            # 优先从 metadata 中获取验证码（AI 提取）
+                            try:
+                                metadata_str = mail.get("metadata")
+                                if metadata_str:
+                                    metadata = json.loads(metadata_str)
+                                    if metadata and "ai_extract" in metadata and metadata["ai_extract"].get("result"):
+                                        code = metadata["ai_extract"]["result"]
+                                        logger.info(f"✅ 从 metadata 获取验证码: {code}")
+                            except Exception as e:
+                                logger.warning(f"⚠️ metadata 解析失败: {e}")
+                            
+                            # 如果 metadata 为空，从 raw 中提取验证码
+                            if not code:
+                                raw = mail.get("raw", "")
+                                if raw:
+                                    import re
+                                    # Step 1: 去掉 quoted-printable 软换行（行尾的 = 表示续行）
+                                    clean_raw = re.sub(r'=\r?\n', '', raw)
+                                    
+                                    # Step 2: 解码 quoted-printable 的 =XX（如 =3D 是 =）
+                                    def decode_qp(match):
+                                        hex_val = match.group(1)
+                                        return chr(int(hex_val, 16))
+                                    clean_raw = re.sub(r'=([0-9A-Fa-f]{2})', decode_qp, clean_raw)
+                                    
+                                    # Step 3: 去掉转义的引号
+                                    clean_raw = clean_raw.replace('\\"', '"')
+                                    
+                                    # 优先匹配 HTML 中的 verification-code span 标签内容
+                                    # 格式: <span class="verification-code" ...>SHCNXF</span>
+                                    html_match = re.search(r'class\s*=\s*["\']?verification-code["\']?[^>]*>([A-Z0-9]{6})<', clean_raw, re.IGNORECASE)
+                                    if html_match:
+                                        code = html_match.group(1)
+                                        logger.info(f"✅ 从 HTML span 提取验证码: {code}")
+                                    else:
+                                        # 备用：匹配验证码格式（6位大写字母+数字，前后有换行或特殊字符）
+                                        text_match = re.search(r'(?:验证码[为是：:\s]*|verification code[:\s]*)[\r\n\s]*([A-Z0-9]{6})[\r\n\s]', clean_raw, re.IGNORECASE)
+                                        if text_match:
+                                            code = text_match.group(1)
+                                            logger.info(f"✅ 从文本提取验证码: {code}")
+                            
+                            if code:
+                                # 获取验证码后立即删除邮件，避免后续刷新时误取旧验证码
+                                if mail_id:
+                                    try:
+                                        requests.delete(
+                                            f"{self.config.mail_api}/admin/mails/{mail_id}",
+                                            headers={"x-admin-auth": self.config.admin_key},
+                                            timeout=10,
+                                            verify=False
+                                        )
+                                        logger.info(f"🗑️ 已删除邮件 [{mail_id}]")
+                                    except Exception as e:
+                                        logger.warning(f"⚠️ 删除邮件失败 [{mail_id}]: {e}")
+                                
+                                return code
             except:
                 pass
             time.sleep(2)
